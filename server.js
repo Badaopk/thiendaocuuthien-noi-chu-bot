@@ -41,6 +41,8 @@ const AI_MIN_REJECT_CONFIDENCE = floatEnv('AI_MIN_REJECT_CONFIDENCE', 0.72);
 const BLOCK_REORDERED_WORDS = boolEnv('BLOCK_REORDERED_WORDS', true);
 const LOCAL_GARBAGE_FILTER = boolEnv('LOCAL_GARBAGE_FILTER', true);
 const AI_STRICT_MEANING = boolEnv('AI_STRICT_MEANING', true);
+const BLOCK_FILLER_WORDS = boolEnv('BLOCK_FILLER_WORDS', true);
+const BLOCK_DUPLICATE_SYLLABLES = boolEnv('BLOCK_DUPLICATE_SYLLABLES', true);
 
 let mongoClient = null;
 let mongoDb = null;
@@ -224,10 +226,33 @@ function localMeaningReject(parsed) {
   if (!LOCAL_GARBAGE_FILTER || !parsed?.syllables) return '';
   const keys = parsed.syllables.map(x => compactKey(x));
 
+  const fillerWords = new Set([
+    'gi', 'nao', 'sao', 'a', 'ha', 'hoi', 'nhi', 'nha', 'nhe', 'nho',
+    'khong', 'ko', 'k', 'hong', 'chu', 'vay', 'the', 'co', 'ma', 'di',
+    'haha', 'hihi', 'hehe', 'lol', 'ok', 'oke', 'uh', 'um', 'u', 'o'
+  ].map(compactKey));
+  const weakTailWords = new Set([
+    'gi', 'nao', 'sao', 'a', 'ha', 'hoi', 'nhi', 'nha', 'nhe', 'nho',
+    'khong', 'ko', 'k', 'hong', 'chu', 'vay', 'the', 'co', 'ma', 'di'
+  ].map(compactKey));
+
   for (const key of keys) {
     if (!key) return 'Có tiếng rỗng hoặc ký tự không hợp lệ.';
     if (/([a-z])\1\1/i.test(key)) return 'Có tiếng bị kéo dài ký tự bất thường, giống spam.';
     if (key.length >= 2 && !/[aeiouy]/i.test(key)) return `Tiếng “${key}” không giống âm tiết tiếng Việt có nghĩa.`;
+    if (BLOCK_FILLER_WORDS && fillerWords.has(key)) {
+      return `Không nhận tiếng đệm/câu hỏi “${key}”. Cụm nối phải là từ hoặc cụm từ có nghĩa, không phải câu hỏi nói miệng.`;
+    }
+  }
+
+  if (BLOCK_DUPLICATE_SYLLABLES) {
+    for (let i = 1; i < keys.length; i++) {
+      if (keys[i] === keys[i - 1]) return 'Không nhận kiểu lặp tiếng như “gì gì”, “nổ nổ”.';
+    }
+  }
+
+  if (BLOCK_FILLER_WORDS && weakTailWords.has(keys[keys.length - 1])) {
+    return 'Không nhận cụm kết thúc bằng tiếng hỏi/đệm như “gì”, “à”, “hả”, “không”.';
   }
 
   const joined = keys.join('');
@@ -423,13 +448,13 @@ async function aiValidateMove(parsed, game) {
 Chỉ trả về JSON hợp lệ, không markdown.
 Nhiệm vụ: đánh giá cụm người chơi vừa nhập có phải cụm tiếng Việt có nghĩa, tự nhiên, không phải chuỗi âm vô nghĩa, không phải spam, không phải xúc phạm hay nội dung nguy hiểm.
 Không cần kiểm tra chữ nối vì server đã kiểm tra. Có thể chấp nhận từ Hán Việt, từ game/tu tiên, thuật ngữ phổ biến, tiếng lóng Việt Nam nếu có nghĩa thật và dùng tự nhiên.
-Phải chấm nghiêm: cụm ghép máy móc, đảo chữ cho có như chỉ hoán vị tiếng của một cụm cũ, hoặc cụm nghe giống Hán Việt nhưng không có nghĩa tự nhiên thì valid=false. Nếu không chắc cụm có nghĩa, hãy valid=false với confidence khoảng 0.75 và nêu lý do ngắn.
+Phải chấm rất nghiêm: cụm ghép máy móc, đảo chữ cho có như chỉ hoán vị tiếng của một cụm cũ, hoặc cụm nghe giống Hán Việt nhưng không có nghĩa tự nhiên thì valid=false. Tuyệt đối không nhận dạng câu hỏi/câu nói đùa/cụm đệm như 'nổ gì', 'gì gì', 'đạo hả', 'tiên không', 'kiếm à'. Cụm được duyệt phải là từ ghép/cụm danh từ/cụm động từ/cụm tính từ có nghĩa thật và dùng tự nhiên. Nếu không chắc cụm có nghĩa, hãy valid=false với confidence khoảng 0.8 và nêu lý do ngắn.
 JSON dạng: {"valid":true|false,"confidence":0..1,"reason":"lý do ngắn","suggestion":"gợi ý sửa nếu sai"}`;
   const input = `Cụm cần xét: ${parsed.phrase}
 Chữ bắt buộc đầu lượt: ${game.required || '(tự do)'}
 Cụm trước: ${game.currentWord || '(chưa có)'}
 Các cụm gần đây: ${lastWords}
-Lưu ý luật nghiêm: không nhận cụm vô nghĩa, gượng ép hoặc đảo thứ tự tiếng từ cụm đã dùng.`;
+Lưu ý luật rất nghiêm: không nhận cụm vô nghĩa, gượng ép, câu hỏi nói miệng, tiếng đệm như 'gì/à/hả/không', lặp tiếng kiểu 'gì gì', hoặc đảo thứ tự tiếng từ cụm đã dùng.`;
   const text = await aiText(instructions, input, 220);
   const data = safeJsonParse(text);
   if (!data || typeof data.valid !== 'boolean') return null;
@@ -849,7 +874,9 @@ AI gợi ý: <b>${AI_HINTS_ENABLED ? 'bật' : 'tắt'}</b>
 AI hỏi đáp /ai: <b>${AI_FREE_CHAT_ENABLED ? 'bật' : 'tắt'}</b>
 Chặn từ đảo: <b>${BLOCK_REORDERED_WORDS ? 'bật' : 'tắt'}</b>
 Lọc từ rác cục bộ: <b>${LOCAL_GARBAGE_FILTER ? 'bật' : 'tắt'}</b>
-Chấm AI nghiêm: <b>${AI_STRICT_MEANING ? 'bật' : 'tắt'}</b>`, msg.message_id);
+Chấm AI nghiêm: <b>${AI_STRICT_MEANING ? 'bật' : 'tắt'}</b>
+Chặn tiếng đệm/câu hỏi: <b>${BLOCK_FILLER_WORDS ? 'bật' : 'tắt'}</b>
+Chặn lặp tiếng: <b>${BLOCK_DUPLICATE_SYLLABLES ? 'bật' : 'tắt'}</b>`, msg.message_id);
 }
 
 async function cmdSkip(msg) {
