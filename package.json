@@ -1,0 +1,19 @@
+{
+  "name": "thiendaocuuthien-noi-chu-bot",
+  "version": "1.0.0",
+  "description": "Telegram group word-chain game bot for @thiendaocuuthien_bot",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "mongodb": "^6.12.0",
+    "openai": "latest"
+  }
+}
