@@ -25,6 +25,7 @@ const NORMAL_TEXT_MODE = String(process.env.NORMAL_TEXT_MODE || 'true').toLowerC
 const PORT = intEnv('PORT', 3000);
 const MONGODB_URI = (process.env.MONGODB_URI || '').trim();
 const MONGODB_DB = (process.env.MONGODB_DB || 'cuuthien_noi_chu').trim();
+const MONGODB_REQUIRED = String(process.env.MONGODB_REQUIRED || 'false').toLowerCase() === 'true';
 
 const RAW_OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_API_KEY = /your_openai_api_key|^sk-your/i.test(RAW_OPENAI_API_KEY) ? '' : RAW_OPENAI_API_KEY;
@@ -37,6 +38,9 @@ const AI_MAX_ASK_CHARS = intEnv('AI_MAX_ASK_CHARS', 900);
 const AI_TIMEOUT_MS = intEnv('AI_TIMEOUT_MS', 12000);
 const AI_COOLDOWN_SECONDS = intEnv('AI_COOLDOWN_SECONDS', 8);
 const AI_MIN_REJECT_CONFIDENCE = floatEnv('AI_MIN_REJECT_CONFIDENCE', 0.72);
+const BLOCK_REORDERED_WORDS = boolEnv('BLOCK_REORDERED_WORDS', true);
+const LOCAL_GARBAGE_FILTER = boolEnv('LOCAL_GARBAGE_FILTER', true);
+const AI_STRICT_MEANING = boolEnv('AI_STRICT_MEANING', true);
 
 let mongoClient = null;
 let mongoDb = null;
@@ -188,6 +192,52 @@ function parseCandidate(raw) {
   };
 }
 
+
+function phraseSignatureFromSyllables(syllables) {
+  return (syllables || [])
+    .map(x => compactKey(x))
+    .filter(Boolean)
+    .sort()
+    .join('|');
+}
+
+function findReorderedPhraseConflict(game, parsed) {
+  if (!BLOCK_REORDERED_WORDS || !parsed?.syllables || parsed.syllables.length < 2) return null;
+  ensureGameDefaults(game);
+  const signature = phraseSignatureFromSyllables(parsed.syllables);
+  if (!signature) return null;
+
+  for (const item of Object.values(game.usedWords || {})) {
+    const oldWord = item?.word || '';
+    const oldParsed = parseCandidate(oldWord);
+    if (!oldParsed.ok) continue;
+    if (oldParsed.key === parsed.key) continue;
+    if (oldParsed.syllables.length !== parsed.syllables.length) continue;
+    if (phraseSignatureFromSyllables(oldParsed.syllables) === signature) {
+      return oldParsed.phrase;
+    }
+  }
+  return null;
+}
+
+function localMeaningReject(parsed) {
+  if (!LOCAL_GARBAGE_FILTER || !parsed?.syllables) return '';
+  const keys = parsed.syllables.map(x => compactKey(x));
+
+  for (const key of keys) {
+    if (!key) return 'Có tiếng rỗng hoặc ký tự không hợp lệ.';
+    if (/([a-z])\1\1/i.test(key)) return 'Có tiếng bị kéo dài ký tự bất thường, giống spam.';
+    if (key.length >= 2 && !/[aeiouy]/i.test(key)) return `Tiếng “${key}” không giống âm tiết tiếng Việt có nghĩa.`;
+  }
+
+  const joined = keys.join('');
+  if (/^(asdf|qwer|zxcv|aaaa|bbbb|cccc|dddd|kkkk|mmmm|xxxx|zzzz)/i.test(joined)) {
+    return 'Cụm này giống gõ bừa bàn phím, không được tính.';
+  }
+
+  return '';
+}
+
 function now() {
   return Date.now();
 }
@@ -237,14 +287,35 @@ async function initDb() {
     console.log('MongoDB chưa cấu hình. Bot sẽ chạy bộ nhớ tạm.');
     return;
   }
-  mongoClient = new MongoClient(MONGODB_URI);
-  await mongoClient.connect();
-  mongoDb = mongoClient.db(MONGODB_DB);
-  await mongoDb.collection('games').createIndex({ chatId: 1 }, { unique: true });
-  await mongoDb.collection('players').createIndex({ chatId: 1, userId: 1 }, { unique: true });
-  await mongoDb.collection('players').createIndex({ chatId: 1, score: -1, wins: -1 });
-  await mongoDb.collection('ledger').createIndex({ chatId: 1, createdAt: -1 });
-  console.log('MongoDB connected:', MONGODB_DB);
+
+  if (MONGODB_URI.includes('<db_password>') || MONGODB_URI.includes('PASTE_DB_PASSWORD_HERE')) {
+    const msg = 'MONGODB_URI vẫn còn placeholder mật khẩu. Hãy thay <db_password> bằng mật khẩu MongoDB thật.';
+    if (MONGODB_REQUIRED) throw new Error(msg);
+    console.warn(msg + ' Bot tạm chạy bằng RAM, restart sẽ mất dữ liệu.');
+    return;
+  }
+
+  try {
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+      socketTimeoutMS: 30000
+    });
+    await mongoClient.connect();
+    mongoDb = mongoClient.db(MONGODB_DB);
+    await mongoDb.collection('games').createIndex({ chatId: 1 }, { unique: true });
+    await mongoDb.collection('players').createIndex({ chatId: 1, userId: 1 }, { unique: true });
+    await mongoDb.collection('players').createIndex({ chatId: 1, score: -1, wins: -1 });
+    await mongoDb.collection('ledger').createIndex({ chatId: 1, createdAt: -1 });
+    console.log('MongoDB connected:', MONGODB_DB);
+  } catch (e) {
+    mongoClient = null;
+    mongoDb = null;
+    console.error('MongoDB connect failed:', e.message);
+    console.error('Bot sẽ tiếp tục chạy bằng RAM. Lưu ý: restart/deploy lại sẽ mất điểm và ván đang chơi.');
+    console.error('Cần kiểm tra MONGODB_URI, mật khẩu đã URL-encode, Network Access/IP allowlist trong MongoDB Atlas.');
+    if (MONGODB_REQUIRED) throw e;
+  }
 }
 
 async function loadGame(chatId) {
@@ -351,12 +422,14 @@ async function aiValidateMove(parsed, game) {
   const instructions = `Bạn là trọng tài game nối chữ tiếng Việt trong group Telegram.
 Chỉ trả về JSON hợp lệ, không markdown.
 Nhiệm vụ: đánh giá cụm người chơi vừa nhập có phải cụm tiếng Việt có nghĩa, tự nhiên, không phải chuỗi âm vô nghĩa, không phải spam, không phải xúc phạm hay nội dung nguy hiểm.
-Không cần kiểm tra chữ nối vì server đã kiểm tra. Có thể chấp nhận từ Hán Việt, từ game/tu tiên, thuật ngữ phổ biến, tiếng lóng Việt Nam nếu có nghĩa.
+Không cần kiểm tra chữ nối vì server đã kiểm tra. Có thể chấp nhận từ Hán Việt, từ game/tu tiên, thuật ngữ phổ biến, tiếng lóng Việt Nam nếu có nghĩa thật và dùng tự nhiên.
+Phải chấm nghiêm: cụm ghép máy móc, đảo chữ cho có như chỉ hoán vị tiếng của một cụm cũ, hoặc cụm nghe giống Hán Việt nhưng không có nghĩa tự nhiên thì valid=false. Nếu không chắc cụm có nghĩa, hãy valid=false với confidence khoảng 0.75 và nêu lý do ngắn.
 JSON dạng: {"valid":true|false,"confidence":0..1,"reason":"lý do ngắn","suggestion":"gợi ý sửa nếu sai"}`;
   const input = `Cụm cần xét: ${parsed.phrase}
 Chữ bắt buộc đầu lượt: ${game.required || '(tự do)'}
 Cụm trước: ${game.currentWord || '(chưa có)'}
-Các cụm gần đây: ${lastWords}`;
+Các cụm gần đây: ${lastWords}
+Lưu ý luật nghiêm: không nhận cụm vô nghĩa, gượng ép hoặc đảo thứ tự tiếng từ cụm đã dùng.`;
   const text = await aiText(instructions, input, 220);
   const data = safeJsonParse(text);
   if (!data || typeof data.valid !== 'boolean') return null;
@@ -371,7 +444,7 @@ async function aiSuggestWords(required, usedWords = {}) {
   const used = Object.values(usedWords || {}).map(x => x.word).filter(Boolean).slice(-80).join(', ');
   const instructions = `Bạn là trợ lý game nối chữ tiếng Việt.
 Chỉ trả về JSON hợp lệ, không markdown.
-Tạo 5 đến 8 cụm tiếng Việt có nghĩa, tự nhiên, bắt đầu đúng bằng tiếng được yêu cầu. Mỗi cụm dài 2-5 tiếng, không trùng danh sách đã dùng, ưu tiên cụm vui/tu tiên nhưng vẫn có nghĩa.
+Tạo 5 đến 8 cụm tiếng Việt có nghĩa, tự nhiên, bắt đầu đúng bằng tiếng được yêu cầu. Mỗi cụm dài 2-5 tiếng, không trùng danh sách đã dùng, không đảo thứ tự tiếng của cụm đã dùng, ưu tiên cụm vui/tu tiên nhưng vẫn có nghĩa.
 JSON dạng: {"suggestions":["cụm 1","cụm 2"]}`;
   const text = await aiText(instructions, `Tiếng bắt buộc: ${required}
 Đã dùng: ${used || '(không có)'}`, 260);
@@ -384,6 +457,8 @@ JSON dạng: {"suggestions":["cụm 1","cụm 2"]}`;
     if (!parsed.ok) continue;
     if (parsed.firstKey !== requiredKey) continue;
     if (usedWords[parsed.key]) continue;
+    if (findReorderedPhraseConflict({ usedWords }, parsed)) continue;
+    if (localMeaningReject(parsed)) continue;
     if (!out.some(x => compactKey(x) === parsed.key)) out.push(parsed.phrase);
   }
   return out.slice(0, 8);
@@ -560,11 +635,13 @@ async function cmdRules(chatId) {
 1) Người đầu tiên nói cụm bất kỳ từ ${MIN_SYLLABLES}-${MAX_SYLLABLES} tiếng.
 2) Người sau phải dùng <b>tiếng cuối</b> của cụm trước làm <b>tiếng đầu</b> của cụm mới.
 3) Không được lặp cụm đã dùng trong ván.
-4) Mỗi lượt đúng +1 điểm.
-5) Quá giờ bị miss. Đủ ${MAX_MISSES} miss sẽ bị loại.
-6) Bot so chữ không phân biệt dấu, ví dụ “hữu” và “huu” được xem là cùng tiếng.
-7) Nếu từ vô nghĩa hoặc gây tranh cãi, admin dùng /huytu để hủy từ cuối.
-8) Nếu bật AI, bot sẽ dùng AI làm trọng tài phụ để giảm từ rác/vô nghĩa.
+4) Không được đảo thứ tự tiếng của cụm đã dùng, ví dụ đã có “kiếm tiên” thì “tiên kiếm” bị chặn.
+5) Cụm vô nghĩa, gõ bừa, ghép gượng ép sẽ bị bot/AI từ chối.
+6) Mỗi lượt đúng +1 điểm.
+7) Quá giờ bị miss. Đủ ${MAX_MISSES} miss sẽ bị loại.
+8) Bot so chữ không phân biệt dấu, ví dụ “hữu” và “huu” được xem là cùng tiếng.
+9) Nếu từ gây tranh cãi, admin dùng /huytu để hủy từ cuối.
+10) Nếu bật AI, bot sẽ dùng AI làm trọng tài phụ để giảm từ rác/vô nghĩa.
 
 Ví dụ: <b>học sinh</b> → <b>sinh viên</b> → <b>viên chức</b> → <b>chức vụ</b>`);
 }
@@ -703,7 +780,10 @@ async function cmdHint(msg) {
   if (!game.requiredKey) return answer(chatId, 'Lượt đầu chưa có chữ bắt buộc. Hãy nói cụm bất kỳ.', msg.message_id);
 
   const local = SUGGESTIONS[game.requiredKey] || [];
-  let unused = local.filter(w => !game.usedWords[compactKey(w)]).slice(0, 5);
+  let unused = local.filter(w => {
+    const parsed = parseCandidate(w);
+    return parsed.ok && !game.usedWords[parsed.key] && !findReorderedPhraseConflict(game, parsed) && !localMeaningReject(parsed);
+  }).slice(0, 5);
 
   if (AI_HINTS_ENABLED && aiReady()) {
     const aiList = await aiSuggestWords(game.required, game.usedWords);
@@ -766,7 +846,10 @@ OPENAI_API_KEY: <b>${OPENAI_API_KEY ? 'đã có' : 'chưa có'}</b>
 Package openai: <b>${OpenAI ? 'đã cài' : 'chưa cài'}</b>
 AI chấm từ khi chơi: <b>${AI_VALIDATE_MOVES ? 'bật' : 'tắt'}</b>
 AI gợi ý: <b>${AI_HINTS_ENABLED ? 'bật' : 'tắt'}</b>
-AI hỏi đáp /ai: <b>${AI_FREE_CHAT_ENABLED ? 'bật' : 'tắt'}</b>`, msg.message_id);
+AI hỏi đáp /ai: <b>${AI_FREE_CHAT_ENABLED ? 'bật' : 'tắt'}</b>
+Chặn từ đảo: <b>${BLOCK_REORDERED_WORDS ? 'bật' : 'tắt'}</b>
+Lọc từ rác cục bộ: <b>${LOCAL_GARBAGE_FILTER ? 'bật' : 'tắt'}</b>
+Chấm AI nghiêm: <b>${AI_STRICT_MEANING ? 'bật' : 'tắt'}</b>`, msg.message_id);
 }
 
 async function cmdSkip(msg) {
@@ -834,6 +917,15 @@ async function acceptMove(msg, rawCandidate, byCommand = false) {
   const parsed = parseCandidate(rawCandidate);
   if (!parsed.ok) return answer(chatId, `❌ ${html(parsed.reason)}`, msg.message_id);
   if (game.usedWords[parsed.key]) return answer(chatId, `❌ Cụm <b>${html(parsed.phrase)}</b> đã được dùng trong ván này.`, msg.message_id);
+
+  const garbageReason = localMeaningReject(parsed);
+  if (garbageReason) return answer(chatId, `❌ Không nhận cụm <b>${html(parsed.phrase)}</b>. ${html(garbageReason)}`, msg.message_id);
+
+  const reorderedConflict = findReorderedPhraseConflict(game, parsed);
+  if (reorderedConflict) {
+    return answer(chatId, `❌ Không nhận cụm <b>${html(parsed.phrase)}</b> vì chỉ đảo thứ tự tiếng của cụm đã dùng: <b>${html(reorderedConflict)}</b>.`, msg.message_id);
+  }
+
   if (game.requiredKey && parsed.firstKey !== game.requiredKey) {
     return answer(chatId, `❌ Sai chữ nối. Cụm mới phải bắt đầu bằng <b>${html(game.required)}</b>.`, msg.message_id);
   }
@@ -841,7 +933,8 @@ async function acceptMove(msg, rawCandidate, byCommand = false) {
   if (AI_VALIDATE_MOVES && aiReady()) {
     const verdict = await aiValidateMove(parsed, game);
     await logEvent(chatId, 'ai_word_checked', { userId: msg.from.id, word: parsed.phrase, verdict });
-    if (verdict && verdict.valid === false && verdict.confidence >= AI_MIN_REJECT_CONFIDENCE) {
+    const rejectThreshold = AI_STRICT_MEANING ? Math.min(AI_MIN_REJECT_CONFIDENCE, 0.55) : AI_MIN_REJECT_CONFIDENCE;
+    if (verdict && verdict.valid === false && verdict.confidence >= rejectThreshold) {
       return answer(chatId,
 `❌ <b>AI trọng tài không duyệt:</b> ${html(parsed.phrase)}
 Lý do: ${html(verdict.reason || 'cụm chưa đủ rõ nghĩa')}${verdict.suggestion ? `
